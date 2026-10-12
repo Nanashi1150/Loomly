@@ -13,6 +13,19 @@ from PIL import Image, ImageTk
 
 from loomly import INDICATOR_SIZE, LoomlyApp
 from cursor_detect import ScrollCursorDetector
+from audio_control import AudioDucker
+from test_audio import FakeEndpoint
+
+
+def capture_dialog(dialog, name):
+    if "--capture" not in sys.argv:
+        return
+    from PIL import ImageGrab
+    dialog.update()
+    time.sleep(0.1)
+    x, y = dialog.winfo_rootx(), dialog.winfo_rooty()
+    ImageGrab.grab(bbox=(x, y, x + dialog.winfo_width(), y + dialog.winfo_height()),
+                   include_layered_windows=True).save(Path(__file__).with_name(f"{name}-preview.png"))
 
 
 def check_cursor_detector(detector):
@@ -96,9 +109,10 @@ def check_middle_callbacks(app, callbacks, keyboard_callback):
 
 def check_app(directory):
     from pynput import mouse, keyboard
+    endpoint = FakeEndpoint()
     with patch("pynput.mouse.Listener", wraps=mouse.Listener) as mouse_listener, \
             patch("pynput.keyboard.Listener", wraps=keyboard.Listener) as keyboard_listener:
-        app = LoomlyApp(data_dir=Path(directory) / "data")
+        app = LoomlyApp(data_dir=Path(directory) / "data", audio=AudioDucker(lambda: endpoint))
     callbacks = mouse_listener.call_args.kwargs
     keyboard_callback = keyboard_listener.call_args.kwargs["on_press"]
     try:
@@ -111,6 +125,10 @@ def check_app(directory):
         assert style & 0x20, "Overlay must allow mouse clicks through"
         assert style & 0x08000000, "Overlay must not take focus"
         assert all(listener.running for listener in app.listeners)
+        # Callback checks inject their own events; live mouse input must not race them.
+        for listener in app.listeners:
+            listener.stop()
+            listener.join(timeout=1)
         check_cursor_detector(app.cursor_detector)
         check_middle_callbacks(app, callbacks, keyboard_callback)
         for _ in range(4):
@@ -118,6 +136,7 @@ def check_app(directory):
         app.tick()
         app.root.update()
         assert abs(app.root.attributes("-alpha") - 0.2) < 0.01
+        assert abs(endpoint.volume - 0.64) < 0.001
         for _ in range(36):
             app.state.register("up")
         app.tick()
@@ -127,6 +146,7 @@ def check_app(directory):
         app.tick()
         app.root.update()
         assert app.root.attributes("-alpha") == 0
+        assert abs(endpoint.volume - 0.8) < 0.001
         assert app.canvas.itemcget(app.triangle, "fill") == "#748A99"
         app.toggle()
         app.root.update()
@@ -136,6 +156,12 @@ def check_app(directory):
         dialog = app.settings_window
         assert dialog is not None and dialog.winfo_viewable()
         assert app.state.suspended and app.root.attributes("-alpha") == 0
+        assert dialog.edit_mode == "normal" and not dialog.notebook.winfo_ismapped()
+        capture_dialog(dialog, "normal")
+        dialog.mode_var.set("custom")
+        assert dialog.switch_mode()
+        app.root.update()
+        assert dialog.notebook.winfo_ismapped()
         dialog.count_var.set("0")
         with patch("loomly.messagebox.showerror") as error:
             assert not dialog.save()
@@ -163,6 +189,8 @@ def check_app(directory):
             assert not dialog.save()
             assert error.called
         dialog.fade_var.set("2.5")
+        dialog.delay_var.set("4")
+        dialog.audio_reduction_var.set("50")
         app.root.update()
         assert dialog.preview_photo is not None
         preview = ImageTk.getimage(dialog.preview_photo)
@@ -171,13 +199,9 @@ def check_app(directory):
             assert not dialog.import_image(Path(directory) / "missing.png")
             assert error.called
         if "--capture" in sys.argv:
-            from PIL import ImageGrab
-            app.root.update()
-            time.sleep(0.2)
-            x, y = dialog.winfo_rootx(), dialog.winfo_rooty()
-            ImageGrab.grab(bbox=(x, y, x + dialog.winfo_width(), y + dialog.winfo_height()),
-                           include_layered_windows=True).save(
-                Path(__file__).with_name("settings-preview.png"))
+            for index, name in enumerate(("custom-dim", "custom-audio", "custom-image")):
+                dialog.notebook.select(index)
+                capture_dialog(dialog, name)
         assert dialog.save()
         assert not app.state.suspended and app.settings_window is None
         assert app.settings.trigger_count == 2
@@ -185,6 +209,8 @@ def check_app(directory):
         assert app.settings.background_scale == 0.5
         assert app.settings.image_intensity == 0.42
         assert app.settings.fade_duration == 2.5
+        assert app.settings.recover_delay == 4
+        assert app.settings.audio_reduction == 0.5
         assert app.overlay_photo is not None
         assert (app.overlay_photo.width(), app.overlay_photo.height()) == app.screen_size
         overlay = ImageTk.getimage(app.overlay_photo)
@@ -199,8 +225,20 @@ def check_app(directory):
         assert app.store.load() == app.settings
         saved = app.settings
         app.close()
-        app = LoomlyApp(data_dir=Path(directory) / "data")
+        app = LoomlyApp(data_dir=Path(directory) / "data", audio=AudioDucker(lambda: endpoint))
         app.root.update()
+        assert app.settings == saved and app.overlay_photo is not None
+        app.open_settings()
+        dialog = app.settings_window
+        dialog.mode_var.set("normal")
+        assert dialog.switch_mode() and dialog.save()
+        assert app.profiles.active_mode == "normal" and app.overlay_photo is None
+        assert app.profiles.custom == saved
+        assert (app.store.directory / saved.background).is_file()
+        app.open_settings()
+        dialog = app.settings_window
+        dialog.mode_var.set("custom")
+        assert dialog.switch_mode() and dialog.save()
         assert app.settings == saved and app.overlay_photo is not None
         app.open_settings()
         dialog = app.settings_window
@@ -208,6 +246,8 @@ def check_app(directory):
         dialog.intensity_var.set("80")
         dialog.fade_var.set("10")
         dialog.remove_image()
+        dialog.mode_var.set("normal")
+        assert dialog.switch_mode()
         dialog.cancel()
         assert app.settings == saved and app.overlay_photo is not None
         app.open_settings()
@@ -234,7 +274,8 @@ def check_app(directory):
         app.exit_requested.set()
         app.tick()
         assert app.closed
-        print("Windows GUI checks passed: middle-button callbacks, dimming, image scaling, preview, validation, restart, cancel, and removal.")
+        assert abs(endpoint.volume - 0.8) < 0.001
+        print("Windows GUI checks passed: dimming, audio restoration, fixed Normal, independent Custom, preview, restart, cancel, and removal.")
     finally:
         app.close()
 

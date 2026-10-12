@@ -39,6 +39,9 @@ class Settings:
     background_scale: float = 1.0
     fade_duration: float = 5.0
     image_intensity: float = BACKGROUND_BRIGHTNESS
+    recover_delay: float = RECOVER_DELAY
+    audio_enabled: bool = True
+    audio_reduction: float = 1.0
 
     def validate(self):
         if type(self.trigger_count) is not int or not 1 <= self.trigger_count <= 100:
@@ -53,9 +56,13 @@ class Settings:
         for value, lower, upper, label in (
             (self.fade_duration, 0, 60, "เวลาภาพจาง (วินาที)"),
             (self.image_intensity, 0, 1, "ความเข้มภาพ (0–100%)"),
+            (self.recover_delay, 0, 60, "เวลารอก่อนคืนความสว่าง (วินาที)"),
+            (self.audio_reduction, 0, 1, "ระดับลดเสียง (0–100%)"),
         ):
             if type(value) not in (int, float) or not lower <= value <= upper:
                 raise ValueError(f"{label}ต้องอยู่ระหว่าง {lower}–{upper}")
+        if type(self.audio_enabled) is not bool:
+            raise ValueError("ค่าการลดเสียงไม่ถูกต้อง")
         if not isinstance(self.background, str) or not isinstance(self.background_name, str):
             raise ValueError("ข้อมูลภาพไม่ถูกต้อง")
         if self.background and (
@@ -67,6 +74,26 @@ class Settings:
         return self
 
 
+@dataclass(frozen=True)
+class Profiles:
+    active_mode: str = "normal"
+    normal: Settings = Settings()
+    custom: Settings = Settings()
+
+    @property
+    def current(self):
+        return getattr(self, self.active_mode)
+
+    def validate(self):
+        if self.active_mode not in ("normal", "custom"):
+            raise ValueError("โหมดไม่ถูกต้อง")
+        self.normal.validate()
+        self.custom.validate()
+        if self.normal != Settings():
+            raise ValueError("Normal ใช้ค่ามาตรฐานตายตัว")
+        return self
+
+
 class SettingsStore:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -74,9 +101,68 @@ class SettingsStore:
 
     def load(self):
         try:
-            return Settings(**json.loads(self.path.read_text(encoding="utf-8"))).validate()
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if "version" in payload:
+                return self.load_profiles().current
+            return Settings(**payload).validate()
         except (OSError, ValueError, TypeError):
             return Settings()
+
+    def load_profiles(self):
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if "version" in payload:
+                if payload["version"] != 2:
+                    raise ValueError("Unsupported settings version")
+                return Profiles(active_mode=payload["active_mode"],
+                                normal=Settings(**payload["normal"]),
+                                custom=Settings(**payload["custom"])).validate()
+            legacy = Settings(**payload).validate()
+            # Existing user choices belong to Custom; Normal always uses factory defaults.
+            return Profiles(active_mode="custom", custom=legacy).validate()
+        except (OSError, ValueError, TypeError, KeyError):
+            return Profiles()
+
+    def save_profiles(self, profiles, images=None, replaced=()):
+        profiles.validate()
+        images = images or {}
+        if any(mode not in ("normal", "custom") for mode in replaced):
+            raise ValueError("โหมดไม่ถูกต้อง")
+        self.directory.mkdir(parents=True, exist_ok=True)
+        created = []
+        temporary = self.directory / f"settings-{uuid.uuid4().hex}.tmp"
+        try:
+            for mode in replaced:
+                image = images.get(mode)
+                if mode == "normal" and image is not None:
+                    raise ValueError("Normal ใช้พื้นหลังดำเท่านั้น")
+                name = f"background-{uuid.uuid4().hex}.png" if image is not None else ""
+                settings = replace(getattr(profiles, mode), background=name,
+                                   background_name=getattr(profiles, mode).background_name if name else "")
+                profiles = replace(profiles, **{mode: settings})
+                if name:
+                    path = self.directory / name
+                    created.append(path)
+                    image.save(path, format="PNG")
+            profiles.validate()
+            payload = {"version": 2, **asdict(profiles)}
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, self.path)
+        except Exception:
+            for path in created:
+                path.unlink(missing_ok=True)
+            raise
+        finally:
+            temporary.unlink(missing_ok=True)
+        # Only prune this app's generated images after the new configuration is durable.
+        referenced = {profiles.normal.background, profiles.custom.background}
+        for path in self.directory.glob("background-*.png"):
+            if path.name not in referenced:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        return profiles
 
     def save(self, settings, image=None, replace_image=False):
         settings.validate()
@@ -264,9 +350,9 @@ class DimState:
         now = time.monotonic() if now is None else now
         with self.lock:
             self._advance_middle(now)
-            if self.dim > 0 and now - self.last > RECOVER_DELAY:
+            if self.dim > 0 and now - self.last >= self.settings.recover_delay:
                 if self.fade_start is None:
-                    self.fade_start, self.fade_level = self.last + RECOVER_DELAY, self.dim
+                    self.fade_start, self.fade_level = self.last + self.settings.recover_delay, self.dim
                 progress = ((now - self.fade_start) / self.settings.fade_duration
                             if self.settings.fade_duration else 1.0)
                 self.dim = self.fade_level * max(0.0, 1.0 - progress)
@@ -315,12 +401,15 @@ def configure_window(window, click_through=False):
 
 
 class LoomlyApp:
-    def __init__(self, data_dir=None):
+    def __init__(self, data_dir=None, audio=None):
         from pynput import keyboard, mouse
 
         base_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
         self.store = SettingsStore(data_dir if data_dir is not None else base_dir / "data")
-        self.settings = self.store.load()
+        self.profiles = self.store.load_profiles()
+        self.settings = self.profiles.current
+        from audio_control import AudioDucker
+        self.audio = audio if audio is not None else AudioDucker()
         self.state = DimState(self.settings)
         from cursor_detect import ScrollCursorDetector
         self.cursor_detector = ScrollCursorDetector()
@@ -413,9 +502,16 @@ class LoomlyApp:
                 self.overlay_photo = None
 
     def apply_settings(self, settings, image=None, replace_image=False):
-        saved = self.store.save(settings, image=image, replace_image=replace_image)
-        self.settings = saved
-        self.state.configure(saved)
+        mode = self.profiles.active_mode
+        profiles = replace(self.profiles, **{mode: settings})
+        self.apply_profiles(profiles, images={mode: image}, replaced=(mode,) if replace_image else ())
+
+    def apply_profiles(self, profiles, images=None, replaced=()):
+        saved = self.store.save_profiles(profiles, images=images, replaced=replaced)
+        self.audio.restore()
+        self.profiles = saved
+        self.settings = saved.current
+        self.state.configure(self.settings)
         self.refresh_background()
         self.root.attributes("-alpha", 0.0)
 
@@ -425,6 +521,7 @@ class LoomlyApp:
             self.settings_window.focus_force()
             return
         self.state.suspend(True)
+        self.audio.restore()
         self.root.attributes("-alpha", 0.0)
         self.settings_window = SettingsDialog(self)
 
@@ -434,6 +531,8 @@ class LoomlyApp:
 
     def toggle(self, event=None):
         enabled = self.state.toggle()
+        self.audio.restore()
+        self.root.attributes("-alpha", 0.0)
         self.canvas.itemconfigure(self.triangle, fill=self.state.indicator_color())
         self.menu.entryconfigure(0, label="Pause dimming" if enabled else "Resume dimming")
 
@@ -454,7 +553,11 @@ class LoomlyApp:
             return
         if self.state.needs_cursor_check():
             self.state.observe_cursor(self.cursor_detector.is_scroll())
-        self.root.attributes("-alpha", self.state.recover())
+        dim = self.state.recover()
+        self.root.attributes("-alpha", dim)
+        self.audio.update(dim, self.settings.audio_enabled, self.settings.audio_reduction)
+        if self.settings_window is not None:
+            self.settings_window.audio_status.configure(text=self.audio.error)
         self.canvas.itemconfigure(self.triangle, fill=self.state.indicator_color())
         # Keep the triangle above the dimming overlay without taking keyboard focus.
         user32 = ctypes.windll.user32
@@ -468,6 +571,7 @@ class LoomlyApp:
         if self.closed:
             return
         self.closed = True
+        self.audio.restore()
         if self.tick_job is not None:
             self.root.after_cancel(self.tick_job)
             self.tick_job = None
@@ -491,76 +595,101 @@ class SettingsDialog(tk.Toplevel):
         self.resizable(False, False)
         self.protocol("WM_DELETE_WINDOW", self.cancel)
         self.bind("<Escape>", lambda event: self.cancel())
-        self.count_var = tk.StringVar(value=str(app.settings.trigger_count))
-        self.step_var = tk.StringVar(value=str(round(app.settings.dim_step * 100)))
-        self.max_var = tk.StringVar(value=str(round(app.settings.max_dim * 100)))
-        self.scale_var = tk.StringVar(value=f"{app.settings.background_scale * 100:g}")
-        self.intensity_var = tk.StringVar(value=f"{app.settings.image_intensity * 100:g}")
-        self.fade_var = tk.StringVar(value=f"{app.settings.fade_duration:g}")
-        self.image_name = app.settings.background_name
+        self.loading = True
+        self.edit_mode = app.profiles.active_mode
+        self.drafts = {"normal": app.profiles.normal, "custom": app.profiles.custom}
+        self.images = {"normal": None, "custom": None}
+        self.changed_images = set()
+        self.mode_var = tk.StringVar(value=self.edit_mode)
+        self.count_var = tk.StringVar()
+        self.step_var = tk.StringVar()
+        self.max_var = tk.StringVar()
+        self.delay_var = tk.StringVar()
+        self.fade_var = tk.StringVar()
+        self.scale_var = tk.StringVar()
+        self.intensity_var = tk.StringVar()
+        self.audio_var = tk.BooleanVar()
+        self.audio_reduction_var = tk.StringVar()
         self.pending_image = None
-        self.image_dirty = False
+        self.image_name = ""
         self.preview_photo = None
+        self.image_warning = ""
+        if app.profiles.custom.background:
+            try:
+                self.images["custom"] = load_background(app.store.directory / app.profiles.custom.background)
+            except (OSError, ValueError, Image.DecompressionBombError):
+                self.image_warning = "ไม่พบภาพที่บันทึกไว้ — ใช้พื้นหลังดำ"
+
         body = ttk.Frame(self, padding=16)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="ตั้งค่าการหรี่หน้าจอ", font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(body, text="หน้าจอจะสว่างตามปกติระหว่างตั้งค่า", font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 8))
-        form = ttk.Frame(body)
-        form.pack(fill="x")
-        for row, (label, variable, upper) in enumerate((
-            ("จำนวนครั้งก่อนเริ่มหรี่", self.count_var, 100),
-            ("หรี่เพิ่มแต่ละครั้ง (%)", self.step_var, 95),
-            ("ระดับการหรี่สูงสุด (%)", self.max_var, 95),
-        )):
-            ttk.Label(form, text=label, font=("Segoe UI", 11)).grid(row=row, column=0, sticky="w", pady=6)
-            ttk.Spinbox(form, from_=1, to=upper, textvariable=variable,
-                        width=10, font=("Segoe UI", 11)).grid(row=row, column=1, sticky="e", padx=(28, 0), pady=6)
-        form.columnconfigure(0, weight=1)
-        self.threshold_label = ttk.Label(body, font=("Segoe UI", 10))
-        self.threshold_label.pack(anchor="w", pady=(4, 8))
-        self.count_var.trace_add("write", self.update_threshold_hint)
-        self.update_threshold_hint()
-        ttk.Separator(body).pack(fill="x", pady=(0, 8))
-        ttk.Label(body, text="ภาพพื้นหลังขณะหรี่", font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        self.preview = tk.Canvas(body, width=440, height=100, bg="#18242D", highlightthickness=0)
-        self.preview.pack(fill="x", pady=(8, 6))
-        self.name_label = ttk.Label(body, wraplength=440, font=("Segoe UI", 10))
+        ttk.Label(body, text="Loomly", font=("Segoe UI", 17, "bold")).pack(anchor="w")
+        ttk.Label(body, text="พักการหรี่และคืนเสียงระหว่างตั้งค่า", font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 10))
+        modes = ttk.Frame(body)
+        modes.pack(fill="x")
+        for value, label in (("normal", "Normal"), ("custom", "Custom")):
+            ttk.Radiobutton(modes, text=label, value=value, variable=self.mode_var,
+                            command=self.switch_mode).pack(side="left", padx=(0, 20))
+        self.mode_hint = ttk.Label(body, wraplength=440)
+        self.mode_hint.pack(anchor="w", pady=(6, 12))
+        self.normal_summary = ttk.LabelFrame(body, text="ค่ามาตรฐาน", padding=14)
+        ttk.Label(self.normal_summary,
+                  text="พื้นหลังดำ • เริ่มหรี่ครั้งที่ 4\nหรี่เพิ่ม 20% • ความทึบสูงสุด 95%\nรอ 3 วินาที • คืนความสว่างใน 5 วินาที\nลดเสียง Windows ตามความทึบ",
+                  justify="left", wraplength=410).pack(anchor="w")
+        self.notebook = ttk.Notebook(body, width=440)
+        self.notebook.pack(fill="both", expand=True)
+        dim_tab = ttk.Frame(self.notebook, padding=12)
+        sound_tab = ttk.Frame(self.notebook, padding=12)
+        self.image_tab = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(dim_tab, text="การหรี่")
+        self.notebook.add(sound_tab, text="เสียง")
+        self.notebook.add(self.image_tab, text="ภาพพื้นหลัง")
+        self.add_fields(dim_tab, (
+            ("จำนวนครั้งก่อนเริ่มหรี่", self.count_var, 1, 100, 1),
+            ("หรี่เพิ่มแต่ละครั้ง (%)", self.step_var, 1, 95, 1),
+            ("ความทึบสูงสุด (%)", self.max_var, 1, 95, 1),
+            ("รอก่อนคืนความสว่าง (วินาที)", self.delay_var, 0, 60, 0.5),
+            ("เวลาคืนความสว่าง (วินาที)", self.fade_var, 0, 60, 0.5),
+        ))
+        self.threshold_label = ttk.Label(dim_tab, wraplength=410)
+        self.threshold_label.pack(anchor="w", pady=(10, 4))
+        ttk.Label(dim_tab, text="เวลาคืนความสว่าง 0 = คืนทันทีหลังช่วงรอ", wraplength=410).pack(anchor="w")
+        ttk.Checkbutton(sound_tab, text="ลดเสียง Windows ตามความทึบ", variable=self.audio_var,
+                        command=self.update_audio_controls).pack(anchor="w", pady=(0, 12))
+        row = ttk.Frame(sound_tab)
+        row.pack(fill="x")
+        ttk.Label(row, text="ระดับลดเสียง (%)").pack(side="left")
+        self.audio_spin = ttk.Spinbox(row, from_=0, to=100, increment=5,
+                                     textvariable=self.audio_reduction_var, width=9)
+        self.audio_spin.pack(side="right")
+        ttk.Label(sound_tab, text="ระดับลดเสียง 100%: ความทึบ 50% จะลดเสียงลงครึ่งหนึ่ง\nคืนเสียงเมื่อจอสว่าง พัก หรือออกจากแอพ\nหากปรับเสียงเอง แอพจะพักการลดเสียงจนจอสว่าง",
+                  wraplength=410, justify="left").pack(anchor="w", pady=(12, 0))
+        self.audio_status = ttk.Label(sound_tab, text=app.audio.error, wraplength=410)
+        self.audio_status.pack(anchor="w", pady=(8, 0))
+        self.preview = tk.Canvas(self.image_tab, width=416, height=120,
+                                 bg="#18242D", highlightthickness=0)
+        self.preview.pack(fill="x", pady=(0, 6))
+        self.name_label = ttk.Label(self.image_tab, wraplength=410)
         self.name_label.pack(anchor="w")
-        image_buttons = ttk.Frame(body)
-        image_buttons.pack(fill="x", pady=(8, 8))
-        ttk.Button(image_buttons, text="นำเข้าภาพ…", command=self.choose_image).pack(side="left")
+        image_buttons = ttk.Frame(self.image_tab)
+        image_buttons.pack(fill="x", pady=8)
+        ttk.Button(image_buttons, text="เลือกภาพ…", command=self.choose_image).pack(side="left")
         ttk.Button(image_buttons, text="นำภาพออก", command=self.remove_image).pack(side="left", padx=8)
-        image_size = ttk.Frame(body)
-        image_size.pack(fill="x", pady=(0, 8))
-        ttk.Label(image_size, text="ขนาดภาพ (%)", font=("Segoe UI", 11)).pack(side="left")
-        ttk.Spinbox(image_size, from_=10, to=200, increment=5,
-                    textvariable=self.scale_var, width=10).pack(side="right")
-        self.scale_var.trace_add("write", self.update_preview)
-        for label, variable, upper, increment in (
-            ("ความเข้มภาพ (%)", self.intensity_var, 100, 5),
-            ("เวลาภาพจาง (วินาที)", self.fade_var, 60, 0.5),
-        ):
-            row = ttk.Frame(body)
-            row.pack(fill="x", pady=(0, 6))
-            ttk.Label(row, text=label, font=("Segoe UI", 11)).pack(side="left")
-            ttk.Spinbox(row, from_=0, to=upper, increment=increment,
-                        textvariable=variable, width=10).pack(side="right")
-        self.intensity_var.trace_add("write", self.update_preview)
-        ttk.Label(body, text="ขนาด 100% = เต็มจอ • ความเข้ม 0% = ดำ, 100% = ภาพเดิม\nหลังหยุดเลื่อน 3 วินาทีจะจางตามเวลาที่ตั้ง • 0 วินาที = หายทันที",
-                  font=("Segoe UI", 10), wraplength=440).pack(anchor="w", pady=(0, 8))
-        buttons = ttk.Frame(body)
-        buttons.pack(fill="x")
+        self.add_fields(self.image_tab, (
+            ("ขนาดภาพ (%)", self.scale_var, 10, 200, 5),
+            ("ความเข้มภาพ (%)", self.intensity_var, 0, 100, 5),
+        ))
+        ttk.Label(self.image_tab, text="ขนาด 100% = ครอบเต็มจอ • ความเข้ม 0% = ดำ", wraplength=410).pack(anchor="w", pady=(8, 0))
+        buttons = self.buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(14, 0))
         self.pause_button = ttk.Button(buttons, command=self.toggle_enabled)
         self.pause_button.pack(side="left")
         self.update_pause_label()
-        ttk.Button(buttons, text="บันทึก", command=self.save).pack(side="right")
+        ttk.Button(buttons, text="บันทึกและใช้โหมดนี้", command=self.save).pack(side="right")
         ttk.Button(buttons, text="ยกเลิก", command=self.cancel).pack(side="right", padx=8)
-        if app.settings.background:
-            try:
-                self.pending_image = load_background(app.store.directory / app.settings.background)
-            except (OSError, ValueError, Image.DecompressionBombError):
-                self.image_name = "ไม่พบภาพที่บันทึกไว้ — จะใช้พื้นหลังดำ"
-        self.update_preview()
+        self.count_var.trace_add("write", self.update_threshold_hint)
+        self.scale_var.trace_add("write", self.update_preview)
+        self.intensity_var.trace_add("write", self.update_preview)
+        self.load_mode()
         self.update_idletasks()
         width, height = self.winfo_reqwidth(), self.winfo_reqheight()
         self.geometry(f"+{max(0, (app.screen_size[0] - width) // 2)}+{max(0, (app.screen_size[1] - height) // 2)}")
@@ -568,12 +697,86 @@ class SettingsDialog(tk.Toplevel):
         self.lift()
         self.focus_force()
 
+    @staticmethod
+    def add_fields(parent, fields):
+        for label, variable, lower, upper, increment in fields:
+            row = ttk.Frame(parent)
+            row.pack(fill="x", pady=5)
+            ttk.Label(row, text=label).pack(side="left")
+            ttk.Spinbox(row, from_=lower, to=upper, increment=increment,
+                        textvariable=variable, width=9).pack(side="right", padx=(16, 0))
+
+    def load_mode(self):
+        self.loading = True
+        settings = self.drafts[self.edit_mode]
+        for variable, value in (
+            (self.count_var, settings.trigger_count), (self.step_var, settings.dim_step * 100),
+            (self.max_var, settings.max_dim * 100), (self.delay_var, settings.recover_delay),
+            (self.fade_var, settings.fade_duration), (self.scale_var, settings.background_scale * 100),
+            (self.intensity_var, settings.image_intensity * 100),
+            (self.audio_reduction_var, settings.audio_reduction * 100),
+        ):
+            variable.set(f"{value:g}")
+        self.audio_var.set(settings.audio_enabled)
+        self.pending_image = self.images[self.edit_mode]
+        self.image_name = settings.background_name
+        if self.edit_mode == "normal":
+            self.notebook.select(0)
+            self.notebook.hide(self.image_tab)
+            self.notebook.pack_forget()
+            self.normal_summary.pack(fill="x", before=self.buttons)
+            self.mode_hint.configure(text="พร้อมใช้ทันที • ค่ามาตรฐานตายตัว")
+        else:
+            self.normal_summary.pack_forget()
+            self.notebook.pack(fill="both", expand=True, before=self.buttons)
+            self.notebook.add(self.image_tab, text="ภาพพื้นหลัง")
+            self.mode_hint.configure(text="ปรับการหรี่ เวลา เสียง และภาพได้ • ไม่เปลี่ยนค่า Normal")
+        self.loading = False
+        self.update_threshold_hint()
+        self.update_audio_controls()
+        self.update_preview()
+
+    def collect_settings(self):
+        if self.edit_mode == "normal":
+            return Settings()
+        return replace(self.drafts[self.edit_mode],
+                       trigger_count=int(self.count_var.get()),
+                       dim_step=float(self.step_var.get()) / 100,
+                       max_dim=float(self.max_var.get()) / 100,
+                       background_name=self.image_name,
+                       background_scale=float(self.scale_var.get()) / 100,
+                       image_intensity=float(self.intensity_var.get()) / 100,
+                       recover_delay=float(self.delay_var.get()),
+                       fade_duration=float(self.fade_var.get()),
+                       audio_enabled=self.audio_var.get(),
+                       audio_reduction=float(self.audio_reduction_var.get()) / 100).validate()
+
+    def switch_mode(self):
+        target = self.mode_var.get()
+        if target == self.edit_mode:
+            return True
+        try:
+            self.drafts[self.edit_mode] = self.collect_settings()
+        except ValueError as error:
+            self.mode_var.set(self.edit_mode)
+            messagebox.showerror("เปลี่ยนโหมดไม่ได้", str(error), parent=self)
+            return False
+        self.images[self.edit_mode] = self.pending_image
+        self.edit_mode = target
+        self.load_mode()
+        self.update_idletasks()
+        self.geometry("")
+        return True
+
     def update_threshold_hint(self, *args):
         try:
             count = int(self.count_var.get())
-            self.threshold_label.configure(text=f"เลื่อนทิศเดียวกันครบ {count} ครั้ง → เริ่มหรี่ในครั้งที่ {count + 1}")
+            self.threshold_label.configure(text=f"เริ่มหรี่ในครั้งที่ {count + 1} เมื่อเลื่อนทิศเดียวกัน")
         except ValueError:
             self.threshold_label.configure(text="กรอกจำนวนครั้งเป็นจำนวนเต็ม 1–100")
+
+    def update_audio_controls(self):
+        self.audio_spin.configure(state="normal" if self.audio_var.get() else "disabled")
 
     def update_pause_label(self):
         self.pause_button.configure(text="พักการหรี่" if self.app.state.enabled else "เปิดการหรี่")
@@ -583,25 +786,28 @@ class SettingsDialog(tk.Toplevel):
         self.update_pause_label()
 
     def update_preview(self, *args):
+        if self.loading:
+            return
         try:
             scale = float(self.scale_var.get()) / 100
             intensity = float(self.intensity_var.get()) / 100
             Settings(background_scale=scale, image_intensity=intensity).validate()
         except ValueError:
-            return  # Allow temporarily empty/invalid text while editing; save validates it.
+            return
         self.preview.delete("all")
         self.preview_photo = None
         if self.pending_image is not None:
             width, height = self.app.screen_size
-            factor = min(440 / width, 100 / height)
+            factor = min(416 / width, 120 / height)
             preview_size = (max(1, round(width * factor)), max(1, round(height * factor)))
             image = render_background(self.pending_image, preview_size, scale)
             image = ImageEnhance.Brightness(image).enhance(intensity)
             self.preview_photo = ImageTk.PhotoImage(image, master=self)
-            self.preview.create_image(220, 50, image=self.preview_photo)
+            self.preview.create_image(208, 60, image=self.preview_photo)
         else:
-            self.preview.create_text(220, 50, text="ไม่มีภาพ — ใช้พื้นหลังดำ", fill="white", font=("Segoe UI", 11))
-        self.name_label.configure(text=self.image_name or "ยังไม่ได้เลือกภาพ")
+            self.preview.create_text(208, 60, text="ไม่มีภาพ — ใช้พื้นหลังดำ", fill="white", font=("Segoe UI", 11))
+        warning = self.image_warning if self.edit_mode == "custom" and self.pending_image is None else ""
+        self.name_label.configure(text=warning or self.image_name or "ยังไม่ได้เลือกภาพ")
 
     def choose_image(self):
         path = filedialog.askopenfilename(parent=self, title="เลือกภาพพื้นหลัง", filetypes=[
@@ -612,6 +818,8 @@ class SettingsDialog(tk.Toplevel):
             self.import_image(path)
 
     def import_image(self, path):
+        if self.edit_mode != "custom":
+            return False
         try:
             image = load_background(path)
         except (OSError, ValueError, Image.DecompressionBombError) as error:
@@ -619,27 +827,26 @@ class SettingsDialog(tk.Toplevel):
             return False
         self.pending_image = image
         self.image_name = Path(path).name
-        self.image_dirty = True
+        self.image_warning = ""
+        self.changed_images.add(self.edit_mode)
         self.update_preview()
         return True
 
     def remove_image(self):
+        if self.edit_mode != "custom":
+            return
         self.pending_image = None
         self.image_name = ""
-        self.image_dirty = True
+        self.image_warning = ""
+        self.changed_images.add(self.edit_mode)
         self.update_preview()
 
     def save(self):
         try:
-            settings = Settings(trigger_count=int(self.count_var.get()),
-                                dim_step=float(self.step_var.get()) / 100,
-                                max_dim=float(self.max_var.get()) / 100,
-                                background=self.app.settings.background,
-                                background_name=self.image_name,
-                                background_scale=float(self.scale_var.get()) / 100,
-                                fade_duration=float(self.fade_var.get()),
-                                image_intensity=float(self.intensity_var.get()) / 100).validate()
-            self.app.apply_settings(settings, image=self.pending_image, replace_image=self.image_dirty)
+            self.drafts[self.edit_mode] = self.collect_settings()
+            self.images[self.edit_mode] = self.pending_image
+            profiles = Profiles(active_mode=self.edit_mode, **self.drafts).validate()
+            self.app.apply_profiles(profiles, images=self.images, replaced=self.changed_images)
         except (ValueError, OSError) as error:
             messagebox.showerror("บันทึกไม่ได้", str(error), parent=self)
             return False
@@ -672,6 +879,18 @@ def main():
             ctypes.windll.user32.SetProcessDPIAware()
         app = LoomlyApp()
         if "--smoke-test" in sys.argv:
+            if "--check-audio" in sys.argv:
+                try:
+                    from audio_control import default_endpoint
+                    endpoint = default_endpoint()
+                    before = endpoint.get_volume()
+                    app.audio.update(0.1, True)
+                    if app.audio.error or abs(endpoint.get_volume() - before * 0.9) > 0.01:
+                        raise RuntimeError("Packaged audio control failed")
+                finally:
+                    app.audio.restore()
+                if abs(endpoint.get_volume() - before) > 0.01:
+                    raise RuntimeError("Packaged audio restoration failed")
             app.root.after(750, app.close)
         app.run()
     finally:
