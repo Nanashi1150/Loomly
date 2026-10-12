@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+build/
+data/
+dist/data/
+dist/*.exe
+!dist/Loomly.exe
+tests/*-preview.png
